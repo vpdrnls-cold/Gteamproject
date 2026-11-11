@@ -1,0 +1,8 @@
+cat << 'EOF' > .gitignore
+.DS_Store
+__pycache__/
+*.py[cod]
+.venv/
+patent_demo.db
+patent_final.db
+EOF
