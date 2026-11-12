@@ -5,4 +5,6 @@ __pycache__/
 .venv/
 patent_demo.db
 patent_final.db
-EOF
+EOFpatent_demo.db
+patent_app_demo.db
+patent_mock.db
