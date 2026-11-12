@@ -18,8 +18,8 @@ OUT = os.path.join(HERE, "patent_app.db")
 SCHEMA = os.path.join(HERE, "schema_work.sql")
 TRIGGERS = os.path.join(HERE, "triggers.sql")
 
-TEAM = [("김연준", "12233929"), ("최재원", "12233967"), ("남건희", "12241871"),
-        ("양재훈", "12245610"), ("박채연", "12253388")]
+# 공개 저장소에 올라가므로 학번은 넣지 않는다 (student_no 는 비워도 되는 컬럼)
+TEAM = ["김연준", "최재원", "남건희", "양재훈", "박채연"]
 
 
 def main():
@@ -35,7 +35,7 @@ def main():
         con.executescript(open(SCHEMA, encoding="utf-8").read())
         con.executescript(open(TRIGGERS, encoding="utf-8").read())
         with con:
-            con.executemany("INSERT INTO team_member(name, student_no) VALUES (?,?)", TEAM)
+            con.executemany("INSERT INTO team_member(name) VALUES (?)", [(name,) for name in TEAM])
         tables = con.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
         triggers = con.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger'").fetchone()[0]
         patents = con.execute("SELECT COUNT(*) FROM patent").fetchone()[0]
