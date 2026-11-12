@@ -928,10 +928,6 @@ def main():
         if "page" not in st.session_state:
             st.session_state["page"] = "대시보드" if ids else "프로젝트 관리"
         page = st.radio("화면", ["대시보드", "특허 탐색", "검토", "프로젝트 관리"], key="page")
-        if st.button("DB 초기화 (원본으로 복원)"):
-            reset_db()
-            st.session_state["flash"] = "원본 DB 상태로 되돌렸습니다."
-            st.rerun()
 
     if "flash" in st.session_state:
         st.toast(st.session_state.pop("flash"))
