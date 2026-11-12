@@ -8,8 +8,9 @@
 구조
   1) SQL 상수            : 화면마다 쓰는 조회 쿼리 (화면의 'SQL 보기'에 그대로 표시)
   2) 업무 규칙 함수       : 후보 등록·검토 저장/제출·담당자 결정·프로젝트 확정
-                          (mock DB에는 트리거가 없어 규칙을 여기서 검사. 실제 DB에 트리거가 올라가면
-                           sqlite3.IntegrityError 로 같은 거부가 일어나고, 화면은 그 메시지를 그대로 보여줌)
+                          (앱에서 먼저 검사하고, 트리거가 있는 DB에서는 같은 규칙을 DB가 한 번 더 막음.
+                           후보 상태 전이(검토중·재검토·담당자결정·결론)는 트리거가 하므로 앱은 건드리지 않음.
+                           DB 거부는 sqlite3.IntegrityError 로 오고, 화면은 그 메시지를 그대로 보여줌)
   3) 화면(Streamlit)      : 대시보드 / 특허 탐색 / 통계 분석 / 검토
 """
 import hashlib
@@ -175,6 +176,9 @@ GROUP BY SUBSTR(application_date, 1, 7)
 ORDER BY 월
 """
 
+# 초록이 20자 미만이거나 한글 명칭과 같은 특허는 검토할 본문이 없어 검색·추천에서 뺀다
+USABLE = "(LENGTH(TRIM(p.abstract)) >= 20 AND TRIM(p.abstract) <> TRIM(p.title_ko))"
+
 SQL_SEARCH = f"""
 SELECT p.patent_id, p.application_no AS 출원번호, p.title_ko AS 명칭, p.application_date AS 출원일,
        COALESCE(p.cited_count, 0)         AS 피인용,
@@ -184,7 +188,8 @@ SELECT p.patent_id, p.application_no AS 출원번호, p.title_ko AS 명칭, p.ap
                WHERE c.project_id = :pid AND c.patent_id = p.patent_id) AS 등록됨
 FROM patent p
 JOIN search_term t ON t.criterion_id = :c AND {_MATCH}
-WHERE (:f IS NULL OR p.application_date >= :f)
+WHERE {USABLE}
+  AND (:f IS NULL OR p.application_date >= :f)
   AND (:t IS NULL OR p.application_date <= :t)
   AND (:a IS NULL OR EXISTS (SELECT 1 FROM patent_applicant pa JOIN applicant a USING (applicant_id)
                              WHERE pa.patent_id = p.patent_id AND a.name_norm LIKE '%' || :a || '%'))
@@ -209,10 +214,10 @@ WITH terms AS (
 )
 SELECT p.patent_id, p.application_no AS 출원번호, p.title_ko AS 명칭, p.application_date AS 출원일,
        h.적중_요소수, h.적중_검색어수, COALESCE(p.cited_count, 0) AS 피인용,
-       p.abstract AS 요약,
        p.abstract AS 요약
 FROM h JOIN patent p ON p.patent_id = h.patent_id
-WHERE NOT EXISTS (SELECT 1 FROM candidate c WHERE c.project_id = :pid AND c.patent_id = h.patent_id)
+WHERE {USABLE}
+  AND NOT EXISTS (SELECT 1 FROM candidate c WHERE c.project_id = :pid AND c.patent_id = h.patent_id)
 ORDER BY h.적중_요소수 DESC, 피인용 DESC, h.적중_검색어수 DESC, p.application_date
 LIMIT :lim
 """
@@ -298,6 +303,9 @@ def save_review(con, candidate_id, member_id, marks, conclusion, note=None, subm
         raise RuleError("이 후보가 속한 프로젝트의 비교요소로만 판정할 수 있습니다 (규칙 5)")
     if any(m not in MARKS for m, _ in marks.values()):
         raise RuleError("판정은 ○/△/X 만 가능합니다 (규칙 6)")
+    if any(not (ev or "").strip() for _, ev in marks.values()):
+        raise RuleError("판정을 고른 비교요소에는 근거를 한 줄씩 적어야 합니다")
+    note = (note or "").strip() or None
     old = _load_review(con, candidate_id, member_id, rnd)
     if old is not None and old["status"] == "SUBMITTED":
         raise RuleError("제출된 검토는 수정·삭제할 수 없습니다 (규칙 7)")
@@ -309,21 +317,19 @@ def save_review(con, candidate_id, member_id, marks, conclusion, note=None, subm
     elif conclusion not in CONCLUSIONS:
         conclusion = None
 
-    with con:
-        if old is None:
+    with con:                                    # 어디서든 거부되면 전체 취소 (규칙 6)
+        if old is None:                          # 항상 DRAFT 로 만든다 (규칙 6: 제출은 UPDATE 로만)
             rid = con.execute("INSERT INTO review(candidate_id, member_id, round, status, conclusion, note) "
                               "VALUES (?,?,?,?,?,?)",
-                              (candidate_id, member_id, rnd, "SUBMITTED" if submit else "DRAFT",
-                               conclusion, note)).lastrowid
+                              (candidate_id, member_id, rnd, "DRAFT", conclusion, note)).lastrowid
         else:
             rid = old["review_id"]
-            con.execute("UPDATE review SET status=?, conclusion=?, note=? WHERE review_id=?",
-                        ("SUBMITTED" if submit else "DRAFT", conclusion, note, rid))
+            con.execute("UPDATE review SET conclusion=?, note=? WHERE review_id=?", (conclusion, note, rid))
             con.execute("DELETE FROM review_item WHERE review_id = ?", (rid,))
         con.executemany("INSERT INTO review_item(review_id, criterion_id, mark, evidence) VALUES (?,?,?,?)",
-                        [(rid, cid, m, ev or None) for cid, (m, ev) in marks.items()])
-        if submit:
-            _advance(con, candidate_id, rnd)
+                        [(rid, cid, m, ev.strip()) for cid, (m, ev) in marks.items()])
+        if submit:                               # 판정 4개를 다 넣은 뒤 마지막에 제출 → 후보 상태는 트리거가 바꿈
+            con.execute("UPDATE review SET status='SUBMITTED' WHERE review_id=?", (rid,))
     return rid
 
 
@@ -338,24 +344,6 @@ def delete_draft(con, candidate_id, member_id):
     with con:
         con.execute("DELETE FROM review_item WHERE review_id = ?", (old["review_id"],))
         con.execute("DELETE FROM review WHERE review_id = ?", (old["review_id"],))
-
-
-def _advance(con, candidate_id, rnd):
-    """제출 후 후보 상태 전이 (규칙 8): 미검토→검토중→재검토→담당자결정→결론"""
-    rows = con.execute("SELECT conclusion FROM review WHERE candidate_id=? AND round=? AND status='SUBMITTED'",
-                       (candidate_id, rnd)).fetchall()
-    if len(rows) < 2:                                        # 아직 한 명만 제출
-        if rnd == 1:
-            con.execute("UPDATE candidate SET status='검토중' WHERE candidate_id=?", (candidate_id,))
-        return
-    concl = {r["conclusion"] for r in rows}
-    if len(concl) == 1 and concl <= {"채택", "제외"}:         # 같은 채택/제외 → 자동 결론
-        con.execute("UPDATE candidate SET status='결론', final_conclusion=? WHERE candidate_id=?",
-                    (concl.pop(), candidate_id))
-    elif rnd == 1:                                           # 다르거나 보류 → 같은 두 검토자가 2차
-        con.execute("UPDATE candidate SET status='재검토' WHERE candidate_id=?", (candidate_id,))
-    else:                                                    # 2차도 갈림 → 담당자 결정
-        con.execute("UPDATE candidate SET status='담당자결정' WHERE candidate_id=?", (candidate_id,))
 
 
 def decide(con, candidate_id, member_id, conclusion, note):
@@ -493,7 +481,6 @@ def page_search(me, names, project_id):
         c1, c2 = st.columns(2)
         cid = c1.selectbox("비교요소", [c["criterion_id"] for c in crit],
                            format_func=lambda i: next(f"{c['no']}. {c['name']}" for c in crit if c["criterion_id"] == i))
-        ipc_values = df(SQL_IPC_OPTIONS)["ipc_subclass"].dropna().astype(str).tolist()
         ipc_values = df(SQL_IPC_OPTIONS)["ipc_subclass"].dropna().astype(str).tolist()
         subclass = c2.selectbox("IPC 분류", ["(전체)", "G06V", "G06F", "G06N", "G06T", "G06Q", "H04N", "G06K", "H04L", "G08G", "H04W", "A61B", "G07C"])
         c3, c4, c5 = st.columns(3)
@@ -642,8 +629,8 @@ def page_analytics():
 
 def page_review(me, names, projects, project_id):
     st.caption(
-        f"검토는 사이드바에서 선택한 사용자({names[me]}) 이름으로 기록돼. "
-        "'담당자 결정'은 1·2차 검토에서도 의견이 갈린 후보를 해당 프로젝트 담당자가 최종 결정하는 기능이야."
+        f"검토는 사이드바에서 선택한 사용자({names[me]}) 이름으로 기록됩니다. "
+        "'담당자 결정'은 1·2차 검토에서도 의견이 갈린 후보를 해당 프로젝트 담당자가 최종 결정하는 기능입니다."
     )
     tab_m, tab_d = st.tabs(["내 검토", "담당자 결정"])
 
@@ -652,11 +639,11 @@ def page_review(me, names, projects, project_id):
         if todo.empty:
             st.success("작성할 검토가 없습니다.")
         else:
-            st.caption("표에서 검토할 후보의 행을 클릭하면 아래에 검토 양식이 열려.")
+            st.caption("표에서 검토할 후보의 행을 클릭하면 아래에 검토 양식이 열립니다.")
             row = table_select(todo, ["candidate_id", "후보상태", "차수"], "todo",
                                drop=["candidate_id"])
             if row is None:
-                st.info("위 표에서 검토할 후보의 행을 클릭해.")
+                st.info("위 표에서 검토할 후보의 행을 클릭하세요.")
             else:
                 review_form(me, int(row["candidate_id"]))
 
@@ -796,14 +783,16 @@ def review_form(me, cid):
                 marks[c["criterion_id"]] = (m, ev)
         concl = st.selectbox("결론", CONCLUSIONS, index=CONCLUSIONS.index(old["conclusion"])
                              if old is not None and old["conclusion"] else None, placeholder="선택")
+        note = st.text_area("종합 의견 (결론이 위 가이드와 다르면 이유를 꼭 적어야 제출됩니다)",
+                            value=(old["note"] or "") if old is not None else "")
         b1, b2, b3 = st.columns(3)
         save = b1.form_submit_button("임시저장")
         sub = b2.form_submit_button("제출", type="primary")
         dele = b3.form_submit_button("임시 검토 삭제")
     if save:
-        act(save_review, cid, me, marks, concl, ok="임시저장했습니다.")
+        act(save_review, cid, me, marks, concl, note, ok="임시저장했습니다.")
     if sub:
-        act(save_review, cid, me, marks, concl, submit=True, ok="제출했습니다.")
+        act(save_review, cid, me, marks, concl, note, submit=True, ok="제출했습니다.")
     if dele:
         act(delete_draft, cid, me, ok="임시 검토를 삭제했습니다.")
 
