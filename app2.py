@@ -7,14 +7,15 @@
 
 구조
   1) SQL 상수            : 화면마다 쓰는 조회 쿼리 (화면의 'SQL 보기'에 그대로 표시)
-  2) 업무 규칙 함수       : 후보 등록·검토 저장/제출·담당자 결정·프로젝트 확정
+  2) 업무 규칙 함수       : 프로젝트·비교요소·검색어 관리·후보 등록·검토 저장/제출·담당자 결정·프로젝트 확정
                           (앱에서 먼저 검사하고, 트리거가 있는 DB에서는 같은 규칙을 DB가 한 번 더 막음.
                            후보 상태 전이(검토중·재검토·담당자결정·결론)는 트리거가 하므로 앱은 건드리지 않음.
                            DB 거부는 sqlite3.IntegrityError 로 오고, 화면은 그 메시지를 그대로 보여줌)
-  3) 화면(Streamlit)      : 대시보드 / 특허 탐색 / 검토
+  3) 화면(Streamlit)      : 대시보드 / 특허 탐색 / 검토 / 프로젝트 관리(팀원·프로젝트·비교요소·검색어·진행 전환)
 """
 import hashlib
 import os
+import re
 import shutil
 import sqlite3
 
@@ -236,8 +237,11 @@ def save_review(con, candidate_id, member_id, marks, conclusion, note=None, subm
     cand = con.execute("SELECT * FROM candidate WHERE candidate_id = ?", (candidate_id,)).fetchone()
     if cand is None:
         raise RuleError("없는 후보입니다 (규칙 1)")
-    if _project(con, cand["project_id"])["status"] == "확정":
+    proj_status = _project(con, cand["project_id"])["status"]
+    if proj_status == "확정":
         raise RuleError("확정된 프로젝트는 수정할 수 없습니다 (규칙 10)")
+    if proj_status != "진행":
+        raise RuleError("검토는 진행 중인 프로젝트에서만 작성할 수 있습니다 (규칙 9)")
     rnd = pending_round(cand["status"])
     if rnd is None:
         raise RuleError(f"'{cand['status']}' 상태의 후보는 검토를 작성할 수 없습니다 (규칙 8)")
@@ -326,6 +330,108 @@ def finalize_project(con, project_id, member_id):
         raise RuleError(f"결론이 없거나 검토자가 2명 미만인 후보가 {bad}건 있어 확정할 수 없습니다 (규칙 10)")
     with con:
         con.execute("UPDATE project SET status='확정' WHERE project_id=?", (project_id,))
+
+
+# ── 프로젝트 준비: 팀원·프로젝트·비교요소·검색어 (규칙 9) ──
+def add_member(con, name, student_no=None, role=None):
+    """팀원 등록 (학번·역할은 선택). 학번 형식·중복은 DB 제약이 검사"""
+    name = (name or "").strip()
+    if not name:
+        raise RuleError("이름을 입력하세요")
+    with con:
+        cur = con.execute("INSERT INTO team_member(name, student_no, role) VALUES (?,?,?)",
+                          (name, (student_no or "").strip() or None, (role or "").strip() or None))
+    return cur.lastrowid
+
+
+def _owner_project(con, project_id, member_id, action):
+    proj = _project(con, project_id)
+    if proj["owner_id"] != member_id:
+        raise RuleError(f"프로젝트 담당자만 {action}할 수 있습니다")
+    return proj
+
+
+def create_project(con, title, owner_id):
+    """프로젝트는 항상 '준비' 상태로 만든다 (규칙 9). 비교요소 4개를 넣은 뒤 '진행'으로 바꾼다"""
+    title = (title or "").strip()
+    if not title:
+        raise RuleError("프로젝트 제목을 입력하세요")
+    with con:
+        cur = con.execute("INSERT INTO project(owner_id, title, status) VALUES (?,?,'준비')", (owner_id, title))
+    return cur.lastrowid
+
+
+def save_criteria(con, project_id, names, member_id):
+    """비교요소 저장. names = {1: 이름, 2: 이름, 3: 이름, 4: 이름}, 빈칸이면 그 번호는 삭제.
+    '준비' 상태에서만 추가·수정·삭제할 수 있다 (규칙 9)"""
+    proj = _owner_project(con, project_id, member_id, "비교요소를 수정")
+    if proj["status"] != "준비":
+        raise RuleError("비교요소는 프로젝트가 준비 상태일 때만 추가·수정·삭제할 수 있습니다 (규칙 9)")
+    current = {c["no"]: c for c in criteria_of(con, project_id)}
+    with con:                                    # 하나라도 거부되면 전체 취소
+        for no in (1, 2, 3, 4):
+            name = (names.get(no) or "").strip()
+            row = current.get(no)
+            if name and row is None:
+                con.execute("INSERT INTO criterion(project_id, no, name) VALUES (?,?,?)", (project_id, no, name))
+            elif name and row["name"] != name:
+                con.execute("UPDATE criterion SET name=? WHERE criterion_id=?", (name, row["criterion_id"]))
+            elif not name and row is not None:
+                con.execute("DELETE FROM criterion WHERE criterion_id=?", (row["criterion_id"],))   # 검색어도 함께 삭제
+
+
+def parse_terms(text):
+    """'a, b\nc' → ['a', 'b', 'c'] (앞뒤 공백 제거, 대소문자만 다른 중복 제거)"""
+    seen, out = set(), []
+    for t in re.split(r"[,\n]", text or ""):
+        t = t.strip()
+        if t and t.casefold() not in seen:
+            seen.add(t.casefold())
+            out.append(t)
+    return out
+
+
+def save_terms(con, project_id, terms_by_criterion, member_id):
+    """비교요소별 동의어 검색어 저장. {criterion_id: '쉼표로 구분한 문자열'}. 확정된 프로젝트는 수정 불가"""
+    proj = _owner_project(con, project_id, member_id, "검색어를 수정")
+    if proj["status"] == "확정":
+        raise RuleError("확정된 프로젝트는 수정할 수 없습니다 (규칙 10)")
+    if not set(terms_by_criterion) <= {c["criterion_id"] for c in criteria_of(con, project_id)}:
+        raise RuleError("이 프로젝트의 비교요소가 아닙니다")
+    with con:
+        for cid, text in terms_by_criterion.items():
+            new = parse_terms(text)
+            keep = {t.casefold() for t in new}
+            old = [r["term"] for r in con.execute("SELECT term FROM search_term WHERE criterion_id=?", (cid,))]
+            for t in old:
+                if t.casefold() not in keep:
+                    con.execute("DELETE FROM search_term WHERE criterion_id=? AND term=?", (cid, t))
+            have = {t.casefold() for t in old}
+            for t in new:
+                if t.casefold() not in have:
+                    con.execute("INSERT INTO search_term(criterion_id, term) VALUES (?,?)", (cid, t))
+
+
+def start_project(con, project_id, member_id):
+    """준비 → 진행: 비교요소가 정확히 4개여야 한다 (규칙 9). 진행 후에는 비교요소를 고칠 수 없다"""
+    proj = _owner_project(con, project_id, member_id, "진행으로 바꿀")
+    if proj["status"] != "준비":
+        raise RuleError("준비 상태의 프로젝트만 진행으로 바꿀 수 있습니다 (규칙 9)")
+    if len(criteria_of(con, project_id)) != 4:
+        raise RuleError("비교요소 4개가 있어야 프로젝트를 진행할 수 있습니다 (규칙 9)")
+    with con:
+        con.execute("UPDATE project SET status='진행' WHERE project_id=?", (project_id,))
+
+
+def delete_project(con, project_id, member_id):
+    """잘못 만든 프로젝트 삭제: 준비 상태이고 후보가 없을 때만 (비교요소·검색어는 함께 삭제)"""
+    proj = _owner_project(con, project_id, member_id, "삭제")
+    if proj["status"] != "준비":
+        raise RuleError("준비 상태의 프로젝트만 삭제할 수 있습니다 (규칙 9)")
+    if con.execute("SELECT COUNT(*) FROM candidate WHERE project_id=?", (project_id,)).fetchone()[0]:
+        raise RuleError("후보가 있는 프로젝트는 삭제할 수 없습니다")
+    with con:
+        con.execute("DELETE FROM project WHERE project_id=?", (project_id,))
 
 
 # ───────────────────────── 3) 화면 ─────────────────────────
@@ -419,6 +525,9 @@ def page_search(me, names, project_id):
     crit = criteria_of(con, project_id)
     owner = _project(con, project_id)["owner_id"]
     con.close()
+    if not crit:
+        st.info("이 프로젝트에는 비교요소가 아직 없습니다. '프로젝트 관리'에서 비교요소와 검색어를 먼저 정하세요.")
+        return
     tab_s, tab_r = st.tabs(["동의어 검색", "후보 추천"])
 
     with tab_s:
@@ -701,6 +810,114 @@ def review_form(me, cid):
         act(delete_draft, cid, me, ok="임시 검토를 삭제했습니다.")
 
 
+CRIT_LABELS = {1: "① 해결 문제", 2: "② 핵심 방법", 3: "③ 입력 데이터", 4: "④ 적용 분야"}
+
+
+def _create_and_select(con, title, owner_id):
+    st.session_state["_select_project"] = create_project(con, title, owner_id)
+
+
+def _delete_and_reset(con, project_id, member_id):
+    delete_project(con, project_id, member_id)
+    st.session_state["_reset_project"] = True
+
+
+def member_box(expanded=False):
+    with st.expander("팀원 등록", expanded=expanded):
+        with st.form("add_member", clear_on_submit=True):
+            c1, c2, c3 = st.columns(3)
+            name = c1.text_input("이름")
+            student_no = c2.text_input("학번 (8자리, 선택)")
+            role = c3.text_input("역할 (선택)")
+            added = st.form_submit_button("팀원 추가")
+        if added:
+            act(add_member, name, student_no, role, ok="팀원을 등록했습니다.")
+
+
+def page_manage(me, names, projects, project_id):
+    st.caption("프로젝트마다 비교요소 4개와 비교요소별 동의어 검색어를 정한 뒤 '진행'으로 바꾸면 검토를 시작할 수 있습니다. "
+               "비교요소는 '준비' 상태에서만 바꿀 수 있고, 진행하면 고칠 수 없습니다 (규칙 9).")
+    st.subheader("새 프로젝트")
+    with st.form("new_project", clear_on_submit=True):
+        title = st.text_input(f"프로젝트 제목 (담당자: {names[me]})", placeholder="예: 신경망 기반 얼굴 인식·인증")
+        created = st.form_submit_button("프로젝트 만들기")
+    if created:
+        act(_create_and_select, title, me, ok="프로젝트를 만들었습니다. 아래에서 비교요소를 정하세요.")
+    member_box()
+
+    if project_id is None:
+        st.info("아직 프로젝트가 없습니다. 위에서 프로젝트를 만들어 주세요.")
+        return
+    proj = projects[projects.project_id == project_id].iloc[0]
+    owner, status = int(proj["owner_id"]), proj["status"]
+    is_owner = owner == me
+    st.divider()
+    st.subheader(f"{proj['title']} — {status}")
+    st.caption(f"담당자: {names[owner]}")
+    if not is_owner:
+        st.info(f"비교요소·검색어는 프로젝트 담당자({names[owner]})만 바꿀 수 있습니다. 사이드바에서 담당자로 전환하세요.")
+
+    con = connect()
+    crit = criteria_of(con, project_id)
+    terms = {c["criterion_id"]: [r["term"] for r in con.execute(
+        "SELECT term FROM search_term WHERE criterion_id=? ORDER BY rowid", (c["criterion_id"],))] for c in crit}
+    con.close()
+    by_no = {c["no"]: c for c in crit}
+
+    st.markdown("**비교요소 4개**")
+    if is_owner and status == "준비":
+        with st.form(f"crit_{project_id}"):
+            vals = {no: st.text_input(label, value=by_no[no]["name"] if no in by_no else "", key=f"cn_{project_id}_{no}")
+                    for no, label in CRIT_LABELS.items()}
+            st.caption("2번은 '핵심 방법'으로 정하세요. 결론 기준(채택)이 2번 판정을 봅니다. "
+                       "빈칸으로 저장하면 그 비교요소는 삭제됩니다.")
+            saved = st.form_submit_button("비교요소 저장")
+        if saved:
+            act(save_criteria, project_id, vals, me, ok="비교요소를 저장했습니다.")
+    elif crit:
+        st.dataframe(pd.DataFrame([{"번호": CRIT_LABELS[c["no"]], "이름": c["name"]} for c in crit]),
+                     hide_index=True, width="stretch")
+    else:
+        st.info("등록된 비교요소가 없습니다.")
+
+    st.markdown("**비교요소별 동의어 검색어**")
+    if not crit:
+        st.info("비교요소를 먼저 저장하세요.")
+    elif is_owner and status != "확정":
+        with st.form(f"terms_{project_id}"):
+            tvals = {c["criterion_id"]: st.text_input(f"{CRIT_LABELS[c['no']]} — {c['name']}",
+                                                      value=", ".join(terms[c["criterion_id"]]),
+                                                      key=f"tm_{project_id}_{c['criterion_id']}")
+                     for c in crit}
+            st.caption("쉼표로 구분해 요소마다 3~5개를 권장합니다. 진행 후에도 고칠 수 있습니다 (확정 전까지).")
+            tsaved = st.form_submit_button("검색어 저장")
+        if tsaved:
+            act(save_terms, project_id, tvals, me, ok="검색어를 저장했습니다.")
+    else:
+        st.dataframe(pd.DataFrame([{"비교요소": f"{CRIT_LABELS[c['no']]} — {c['name']}",
+                                    "검색어": ", ".join(terms[c["criterion_id"]])} for c in crit]),
+                     hide_index=True, width="stretch")
+
+    st.markdown("**진행 상태**")
+    if status == "준비":
+        if len(crit) != 4:
+            st.warning("비교요소 4개를 모두 저장해야 진행할 수 있습니다 "
+                       f"(빠진 것: {', '.join(l for n, l in CRIT_LABELS.items() if n not in by_no)}).")
+        elif any(not terms[c["criterion_id"]] for c in crit):
+            st.warning("검색어가 없는 비교요소가 있습니다. 동의어 검색·후보 추천에서 그 요소는 적중하지 않습니다.")
+        st.caption("'진행'으로 바꾸면 비교요소를 더 이상 고칠 수 없고, 그때부터 검토를 작성할 수 있습니다.")
+        if st.button("진행으로 바꾸기", type="primary", disabled=not is_owner):
+            act(start_project, project_id, me, ok="프로젝트를 진행 상태로 바꿨습니다.")
+        with st.expander("프로젝트 삭제 (준비 상태, 후보가 없을 때만)"):
+            confirm = st.checkbox("이 프로젝트를 삭제합니다", key=f"del_{project_id}")
+            if st.button("삭제", disabled=not (is_owner and confirm)):
+                act(_delete_and_reset, project_id, me, ok="프로젝트를 삭제했습니다.")
+    elif status == "진행":
+        st.success("진행 중입니다. 비교요소는 고칠 수 없고, 확정은 대시보드에서 합니다.")
+    else:
+        st.info("확정된 프로젝트입니다.")
+
+
 def main():
     st.set_page_config(page_title="선행기술 조사·검토", layout="wide")
     if not os.path.exists(WORK_DB):
@@ -709,6 +926,11 @@ def main():
             return
         reset_db()
     members = df("SELECT member_id, name FROM team_member ORDER BY member_id")
+    if members.empty:
+        st.title("선행기술 조사·검토")
+        st.info("팀원이 아직 없습니다. 먼저 팀원을 등록하세요.")
+        member_box(expanded=True)
+        return
     projects = df("SELECT project_id, title, owner_id, status FROM project ORDER BY project_id")
     names = dict(zip(members.member_id.astype(int), members.name))
     ptitle = {int(r.project_id): f"{r.project_id}. {r.title} [{r.status}]" for r in projects.itertuples()}
@@ -721,10 +943,16 @@ def main():
         me = st.selectbox("현재 사용자", list(names), format_func=names.get)
         own = projects[projects.owner_id == me].project_id.astype(int).tolist()
         ids = list(ptitle)
+        if st.session_state.pop("_reset_project", False):         # 선택한 프로젝트를 삭제한 직후
+            st.session_state.pop(f"proj_{me}", None)
+        if "_select_project" in st.session_state:                 # 방금 만든 프로젝트를 바로 선택
+            st.session_state[f"proj_{me}"] = st.session_state.pop("_select_project")
         project_id = st.selectbox(
             "조사 프로젝트", ids, index=ids.index(own[0]) if own else 0, key=f"proj_{me}",   # 사용자별로 기본값 유지
-            format_func=lambda i: ptitle[i] + (" ← 내 프로젝트" if i in own else ""))
-        page = st.radio("화면", ["대시보드", "특허 탐색", "검토"])
+            format_func=lambda i: ptitle[i] + (" ← 내 프로젝트" if i in own else "")) if ids else None
+        if "page" not in st.session_state:
+            st.session_state["page"] = "대시보드" if ids else "프로젝트 관리"
+        page = st.radio("화면", ["대시보드", "특허 탐색", "검토", "프로젝트 관리"], key="page")
         if st.button("DB 초기화 (원본으로 복원)"):
             reset_db()
             st.session_state["flash"] = "원본 DB 상태로 되돌렸습니다."
@@ -732,7 +960,11 @@ def main():
 
     if "flash" in st.session_state:
         st.toast(st.session_state.pop("flash"))
-    if page == "대시보드":
+    if page == "프로젝트 관리":
+        page_manage(me, names, projects, project_id)
+    elif project_id is None:
+        st.info("아직 프로젝트가 없습니다. '프로젝트 관리'에서 먼저 만드세요.")
+    elif page == "대시보드":
         page_dashboard(me, names, project_id)
     elif page == "특허 탐색":
         page_search(me, names, project_id)
