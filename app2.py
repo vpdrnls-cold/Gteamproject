@@ -11,7 +11,7 @@
                           (앱에서 먼저 검사하고, 트리거가 있는 DB에서는 같은 규칙을 DB가 한 번 더 막음.
                            후보 상태 전이(검토중·재검토·담당자결정·결론)는 트리거가 하므로 앱은 건드리지 않음.
                            DB 거부는 sqlite3.IntegrityError 로 오고, 화면은 그 메시지를 그대로 보여줌)
-  3) 화면(Streamlit)      : 대시보드 / 특허 탐색 / 통계 분석 / 검토
+  3) 화면(Streamlit)      : 대시보드 / 특허 탐색 / 검토
 """
 import hashlib
 import os
@@ -120,60 +120,6 @@ SELECT DISTINCT ipc_subclass
 FROM patent_ipc
 WHERE ipc_subclass IS NOT NULL AND TRIM(ipc_subclass) <> ''
 ORDER BY ipc_subclass
-"""
-
-SQL_TOP_APPLICANTS = """
-SELECT a.name_norm AS 출원인, COUNT(DISTINCT pa.patent_id) AS 특허수
-FROM applicant a
-JOIN patent_applicant pa USING (applicant_id)
-GROUP BY a.applicant_id, a.name_norm
-ORDER BY 특허수 DESC, 출원인
-LIMIT 15
-"""
-
-SQL_JOINT_APPLICANTS = """
-SELECT COUNT(*) AS 공동출원_특허수
-FROM (
-    SELECT patent_id
-    FROM patent_applicant
-    GROUP BY patent_id
-    HAVING COUNT(DISTINCT applicant_id) >= 2
-)
-"""
-
-SQL_TOP_JOINT_GROUPS = """
-WITH joint AS (
-    SELECT patent_id, GROUP_CONCAT(name_norm, ' · ') AS 공동출원인
-    FROM (
-        SELECT pa.patent_id, a.name_norm
-        FROM patent_applicant pa
-        JOIN applicant a USING (applicant_id)
-        ORDER BY pa.patent_id, a.name_norm
-    )
-    GROUP BY patent_id
-    HAVING COUNT(*) >= 2
-)
-SELECT 공동출원인, COUNT(*) AS 특허수
-FROM joint
-GROUP BY 공동출원인
-ORDER BY 특허수 DESC, 공동출원인
-LIMIT 15
-"""
-
-SQL_IPC_DISTRIBUTION = """
-SELECT ipc_subclass AS IPC, COUNT(DISTINCT patent_id) AS 특허수
-FROM patent_ipc
-GROUP BY ipc_subclass
-ORDER BY 특허수 DESC, IPC
-LIMIT 15
-"""
-
-SQL_MONTHLY_TREND = """
-SELECT SUBSTR(application_date, 1, 7) AS 월,
-       COUNT(*) AS 출원건수
-FROM patent
-GROUP BY SUBSTR(application_date, 1, 7)
-ORDER BY 월
 """
 
 # 초록이 20자 미만이거나 한글 명칭과 같은 특허는 검토할 본문이 없어 검색·추천에서 뺀다
@@ -585,48 +531,6 @@ def register_box(row, project_id, owner, names, key, me):
         act(register_candidate, project_id, patent_id, revs, by_member=me, ok="후보를 등록했습니다.")
 
 
-def page_analytics():
-    st.caption("KIPRIS 적재 데이터 기준 보조 통계야. 출원인 표기는 정규화 이름(name_norm)을 사용해.")
-    top, joint, ipc, monthly = st.tabs(["출원인 점유율", "공동출원", "IPC 분포", "월별 출원 추이"])
-    with top:
-        data = df(SQL_TOP_APPLICANTS)
-        if not data.empty:
-            st.subheader("특허 출원인 Top 15")
-            st.bar_chart(data.set_index("출원인")["특허수"], horizontal=True)
-            st.dataframe(data, hide_index=True, width="stretch")
-        else:
-            st.info("출원인 데이터가 없습니다.")
-        sql_box(SQL_TOP_APPLICANTS)
-    with joint:
-        count = int(df(SQL_JOINT_APPLICANTS).iloc[0]["공동출원_특허수"])
-        total = int(df("SELECT COUNT(*) AS n FROM patent").iloc[0]["n"])
-        a, b, c = st.columns(3)
-        a.metric("전체 특허", f"{total:,}건")
-        b.metric("공동출원 특허", f"{count:,}건")
-        c.metric("공동출원 비율", f"{100 * count / total:.1f}%" if total else "0%")
-        groups = df(SQL_TOP_JOINT_GROUPS)
-        st.dataframe(groups, hide_index=True, width="stretch")
-        sql_box(SQL_JOINT_APPLICANTS)
-        sql_box(SQL_TOP_JOINT_GROUPS)
-    with ipc:
-        data = df(SQL_IPC_DISTRIBUTION)
-        if not data.empty:
-            st.subheader("IPC 서브클래스별 특허 수")
-            st.bar_chart(data.set_index("IPC")["특허수"], horizontal=True)
-            st.dataframe(data, hide_index=True, width="stretch")
-        else:
-            st.info("IPC 데이터가 없습니다.")
-        sql_box(SQL_IPC_DISTRIBUTION)
-    with monthly:
-        data = df(SQL_MONTHLY_TREND)
-        if not data.empty:
-            st.subheader("월별 출원 건수")
-            st.line_chart(data.set_index("월")["출원건수"])
-        else:
-            st.info("출원일 데이터가 없습니다.")
-        sql_box(SQL_MONTHLY_TREND)
-
-
 def page_review(me, names, projects, project_id):
     st.caption(
         f"검토는 사이드바에서 선택한 사용자({names[me]}) 이름으로 기록됩니다. "
@@ -820,7 +724,7 @@ def main():
         project_id = st.selectbox(
             "조사 프로젝트", ids, index=ids.index(own[0]) if own else 0, key=f"proj_{me}",   # 사용자별로 기본값 유지
             format_func=lambda i: ptitle[i] + (" ← 내 프로젝트" if i in own else ""))
-        page = st.radio("화면", ["대시보드", "특허 탐색", "통계 분석 (보조 조회)", "검토"])
+        page = st.radio("화면", ["대시보드", "특허 탐색", "검토"])
         if st.button("DB 초기화 (원본으로 복원)"):
             reset_db()
             st.session_state["flash"] = "원본 DB 상태로 되돌렸습니다."
@@ -832,8 +736,6 @@ def main():
         page_dashboard(me, names, project_id)
     elif page == "특허 탐색":
         page_search(me, names, project_id)
-    elif page == "통계 분석 (보조 조회)":
-        page_analytics()
     else:
         page_review(me, names, projects, project_id)
 
