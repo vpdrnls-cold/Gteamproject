@@ -1,8 +1,8 @@
-"""G팀 선행기술 조사·검토 시스템 — Streamlit 시안 (mock DB용)
+"""G팀 선행기술 조사·검토 시스템 — Streamlit 시안
 
 실행:  streamlit run app.py
 설치:  pip install -U streamlit pandas      (표 너비 옵션 width="stretch" 때문에 최신 버전 권장)
-파일:  app.py 와 같은 폴더의 patent_mock.db  (원본은 건드리지 않고 patent_demo.db 로 복사해서 사용)
+파일:  app.py 와 같은 폴더의 patent_app.db  (build_db.py 로 만든 것. 원본은 건드리지 않고 patent_demo.db 로 복사해서 사용)
        다른 DB 를 쓰려면 환경변수 PATENT_DB_SRC (원본), PATENT_DB (작업 사본) 지정
 
 구조
@@ -11,7 +11,7 @@
                           (앱에서 먼저 검사하고, 트리거가 있는 DB에서는 같은 규칙을 DB가 한 번 더 막음.
                            후보 상태 전이(검토중·재검토·담당자결정·결론)는 트리거가 하므로 앱은 건드리지 않음.
                            DB 거부는 sqlite3.IntegrityError 로 오고, 화면은 그 메시지를 그대로 보여줌)
-  3) 화면(Streamlit)      : 대시보드 / 특허 탐색 / 검토 / 프로젝트 관리(팀원·프로젝트·비교요소·검색어·진행 전환)
+  3) 화면(Streamlit)      : 대시보드 / 특허 탐색 / 검토 / 프로젝트 관리(프로젝트·비교요소·검색어·진행 전환)
 """
 import hashlib
 import os
@@ -29,7 +29,7 @@ def _abs(path):
     return path if os.path.isabs(path) else os.path.join(HERE, path)
 
 
-SRC_DB = _abs(os.environ.get("PATENT_DB_SRC", "patent_mock.db"))
+SRC_DB = _abs(os.environ.get("PATENT_DB_SRC", "patent_app.db"))
 WORK_DB = _abs(os.environ.get("PATENT_DB", "patent_demo.db"))
 MARKS = ["○", "△", "X"]
 CONCLUSIONS = ["채택", "제외", "보류"]
@@ -332,18 +332,7 @@ def finalize_project(con, project_id, member_id):
         con.execute("UPDATE project SET status='확정' WHERE project_id=?", (project_id,))
 
 
-# ── 프로젝트 준비: 팀원·프로젝트·비교요소·검색어 (규칙 9) ──
-def add_member(con, name, student_no=None, role=None):
-    """팀원 등록 (학번·역할은 선택). 학번 형식·중복은 DB 제약이 검사"""
-    name = (name or "").strip()
-    if not name:
-        raise RuleError("이름을 입력하세요")
-    with con:
-        cur = con.execute("INSERT INTO team_member(name, student_no, role) VALUES (?,?,?)",
-                          (name, (student_no or "").strip() or None, (role or "").strip() or None))
-    return cur.lastrowid
-
-
+# ── 프로젝트 준비: 프로젝트·비교요소·검색어 (규칙 9) ──
 def _owner_project(con, project_id, member_id, action):
     proj = _project(con, project_id)
     if proj["owner_id"] != member_id:
@@ -822,18 +811,6 @@ def _delete_and_reset(con, project_id, member_id):
     st.session_state["_reset_project"] = True
 
 
-def member_box(expanded=False):
-    with st.expander("팀원 등록", expanded=expanded):
-        with st.form("add_member", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
-            name = c1.text_input("이름")
-            student_no = c2.text_input("학번 (8자리, 선택)")
-            role = c3.text_input("역할 (선택)")
-            added = st.form_submit_button("팀원 추가")
-        if added:
-            act(add_member, name, student_no, role, ok="팀원을 등록했습니다.")
-
-
 def page_manage(me, names, projects, project_id):
     st.caption("프로젝트마다 비교요소 4개와 비교요소별 동의어 검색어를 정한 뒤 '진행'으로 바꾸면 검토를 시작할 수 있습니다. "
                "비교요소는 '준비' 상태에서만 바꿀 수 있고, 진행하면 고칠 수 없습니다 (규칙 9).")
@@ -843,7 +820,6 @@ def page_manage(me, names, projects, project_id):
         created = st.form_submit_button("프로젝트 만들기")
     if created:
         act(_create_and_select, title, me, ok="프로젝트를 만들었습니다. 아래에서 비교요소를 정하세요.")
-    member_box()
 
     if project_id is None:
         st.info("아직 프로젝트가 없습니다. 위에서 프로젝트를 만들어 주세요.")
@@ -928,8 +904,7 @@ def main():
     members = df("SELECT member_id, name FROM team_member ORDER BY member_id")
     if members.empty:
         st.title("선행기술 조사·검토")
-        st.info("팀원이 아직 없습니다. 먼저 팀원을 등록하세요.")
-        member_box(expanded=True)
+        st.error("DB에 팀원이 없습니다. build_db.py 로 patent_app.db 를 만든 뒤 실행하세요.")
         return
     projects = df("SELECT project_id, title, owner_id, status FROM project ORDER BY project_id")
     names = dict(zip(members.member_id.astype(int), members.name))
