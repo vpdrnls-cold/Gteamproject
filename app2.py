@@ -620,24 +620,24 @@ def page_review(me, names, projects, project_id):
                                     st.dataframe(items, hide_index=True, width="stretch")
 
                     st.warning(
-                        "최종 결정은 검토자들의 결론과 비교요소별 판정 근거를 확인한 뒤 내려줘. "
-                        "결정 사유는 필수로 기록해야 해."
+                        "최종 결정은 검토자들의 결론과 비교요소별 판정 근거를 확인한 뒤 내려주세요. "
+                        "결정 사유는 필수로 기록해야 합니다."
                     )
                     with st.form("decide"):
                         concl = st.radio(
                             "최종 결론", ["채택", "제외"], index=None, horizontal=True
                         )
-                        note = st.text_area("결정 사유", placeholder="최종 결론을 내린 근거를 입력해.")
+                        note = st.text_area("결정 사유", placeholder="최종 결론을 내린 근거를 입력하세요.")
                         submitted = st.form_submit_button("최종 결정", type="primary")
                     if submitted:
                         if concl is None:
-                            st.error("최종 결론으로 채택 또는 제외를 선택해.")
+                            st.error("최종 결론으로 채택 또는 제외를 선택하세요.")
                         elif not note.strip():
-                            st.error("결정 사유를 입력해야 해.")
+                            st.error("결정 사유를 입력해야 합니다.")
                         else:
                             act(
                                 decide, cid, me, concl, note,
-                                ok="최종 결론을 기록했어."
+                                ok="최종 결론을 기록했습니다."
                             )
 
 
