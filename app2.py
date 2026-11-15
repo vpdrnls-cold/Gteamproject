@@ -4,6 +4,8 @@
 설치:  pip install -U streamlit pandas      (표 너비 옵션 width="stretch" 때문에 최신 버전 권장)
 파일:  app.py 와 같은 폴더의 patent_app.db  (build_db.py 로 만든 것. 원본은 건드리지 않고 patent_demo.db 로 복사해서 사용)
        다른 DB 를 쓰려면 환경변수 PATENT_DB_SRC (원본), PATENT_DB (작업 사본) 지정
+백업:  Streamlit Cloud 는 재시작하면 로컬 파일이 사라지므로, Secrets 의 [supabase] 설정(url·key·bucket)이 있으면
+       쓰기에 성공할 때마다 작업 사본을 Supabase Storage 에 올리고, 시작할 때 거기서 복원한다 (없으면 기존처럼 로컬만 사용)
 
 구조
   1) SQL 상수            : 화면마다 쓰는 조회 쿼리 (화면의 'SQL 보기'에 그대로 표시)
@@ -20,6 +22,7 @@ import shutil
 import sqlite3
 
 import pandas as pd
+import requests
 import streamlit as st
 
 HERE = os.path.dirname(os.path.abspath(__file__))     # 어느 폴더에서 실행해도 app.py 옆 파일을 찾도록
@@ -187,6 +190,50 @@ def df(sql, params=(), path=None):
 
 def reset_db():
     shutil.copyfile(SRC_DB, WORK_DB)
+
+
+# ───────────── 외부 백업 (Supabase Storage) ─────────────
+def _sb():
+    """Secrets 에 [supabase] 설정이 없으면 None → 백업 없이 로컬 파일만 사용"""
+    try:
+        s = st.secrets["supabase"]
+        url = f"{s['url'].rstrip('/')}/storage/v1/object/{s['bucket']}/{os.path.basename(WORK_DB)}"
+        return url, {"apikey": s["key"], "Authorization": f"Bearer {s['key']}"}
+    except Exception:
+        return None
+
+
+def pull_db():
+    """시작할 때: 외부에 백업이 있으면 내려받아 WORK_DB 로 쓴다. 성공하면 True"""
+    cfg = _sb()
+    if cfg is None:
+        return False
+    try:
+        r = requests.get(cfg[0], headers=cfg[1], timeout=60)
+        if r.status_code == 200 and r.content.startswith(b"SQLite format 3"):
+            with open(WORK_DB, "wb") as f:
+                f.write(r.content)
+            return True
+        print(f"[backup] pull: 백업 없음 또는 응답 이상 ({r.status_code})")
+    except requests.RequestException as e:
+        print(f"[backup] pull 실패: {e}")
+    return False
+
+
+def push_db():
+    """쓰기가 성공한 뒤: 작업 DB 를 통째로 올린다 (같은 경로면 덮어쓰기). 실패해도 앱은 계속 동작"""
+    cfg = _sb()
+    if cfg is None:
+        return
+    try:
+        with open(WORK_DB, "rb") as f:
+            r = requests.post(cfg[0], data=f, timeout=120,
+                              headers={**cfg[1], "x-upsert": "true",
+                                       "Content-Type": "application/octet-stream"})
+        if not r.ok:
+            print(f"[backup] push 실패: {r.status_code} {r.text[:200]}")
+    except requests.RequestException as e:
+        print(f"[backup] push 실패: {e}")
 
 
 # ───────────────────── 2) 업무 규칙 함수 ─────────────────────
@@ -439,6 +486,8 @@ def act(fn, *args, ok="완료", **kw):
     except sqlite3.IntegrityError as e:
         st.error(f"DB가 거부함: {e}")
     else:
+        con.close()
+        push_db()                                # 쓰기 성공 → 외부에 백업
         st.session_state["flash"] = ok
         st.rerun()
     finally:
@@ -897,10 +946,11 @@ def page_manage(me, names, projects, project_id):
 def main():
     st.set_page_config(page_title="선행기술 조사·검토", layout="wide")
     if not os.path.exists(WORK_DB):
-        if not os.path.exists(SRC_DB):
-            st.error(f"{SRC_DB} 파일이 없습니다. app.py 와 같은 폴더에 DB 파일을 넣어주세요.")
-            return
-        reset_db()
+        if not pull_db():                                    # 외부 백업이 있으면 그걸로 복원
+            if not os.path.exists(SRC_DB):
+                st.error(f"{SRC_DB} 파일이 없습니다. app.py 와 같은 폴더에 DB 파일을 넣어주세요.")
+                return
+            reset_db()
     members = df("SELECT member_id, name FROM team_member ORDER BY member_id")
     if members.empty:
         st.title("선행기술 조사·검토")
