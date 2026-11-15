@@ -6,6 +6,7 @@
        다른 DB 를 쓰려면 환경변수 PATENT_DB_SRC (원본), PATENT_DB (작업 사본) 지정
 백업:  Streamlit Cloud 는 재시작하면 로컬 파일이 사라지므로, Secrets 의 [supabase] 설정(url·key·bucket)이 있으면
        쓰기에 성공할 때마다 작업 사본을 Supabase Storage 에 올리고, 시작할 때 거기서 복원한다 (없으면 기존처럼 로컬만 사용)
+되돌리기: 같은 때에 그 시점의 DB 를 snapshots/ 폴더에 복사해 두고(최근 30개), '되돌리기' 화면에서 시점을 골라 복원한다
 
 구조
   1) SQL 상수            : 화면마다 쓰는 조회 쿼리 (화면의 'SQL 보기'에 그대로 표시)
@@ -13,13 +14,14 @@
                           (앱에서 먼저 검사하고, 트리거가 있는 DB에서는 같은 규칙을 DB가 한 번 더 막음.
                            후보 상태 전이(검토중·재검토·담당자결정·결론)는 트리거가 하므로 앱은 건드리지 않음.
                            DB 거부는 sqlite3.IntegrityError 로 오고, 화면은 그 메시지를 그대로 보여줌)
-  3) 화면(Streamlit)      : 대시보드 / 특허 탐색 / 검토 / 프로젝트 관리(프로젝트·비교요소·검색어·진행 전환)
+  3) 화면(Streamlit)      : 대시보드 / 특허 탐색 / 검토 / 프로젝트 관리(프로젝트·비교요소·검색어·진행 전환) / 되돌리기
 """
 import hashlib
 import os
 import re
 import shutil
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -192,15 +194,70 @@ def reset_db():
     shutil.copyfile(SRC_DB, WORK_DB)
 
 
-# ───────────── 외부 백업 (Supabase Storage) ─────────────
+# ───────────── 외부 백업 · 시점 기록 (Supabase Storage) ─────────────
+MAIN_KEY = os.path.basename(WORK_DB)             # 최신 백업 (버킷 맨 위)
+SNAP_DIR = "snapshots"                           # 시점 기록 폴더: snapshots/<시각>__m<사용자번호>__<작업>.db
+SNAP_KEEP = 30                                   # 시점 기록은 최근 30개만 남긴다 (오래된 것부터 삭제)
+KST = timezone(timedelta(hours=9))
+_SNAP_RE = re.compile(r"^\d{8}_\d{9}__m\d+__[A-Za-z0-9_-]+\.db$")
+ACTION_LABELS = {
+    "create_and_select": "프로젝트 만들기", "delete_and_reset": "프로젝트 삭제",
+    "save_criteria": "비교요소 저장", "save_terms": "검색어 저장", "start_project": "진행으로 전환",
+    "register_candidate": "후보 등록", "save_review": "검토 임시저장", "save_review-submit": "검토 제출",
+    "delete_draft": "임시 검토 삭제", "decide": "담당자 결정", "finalize_project": "프로젝트 확정",
+    "restore": "되돌리기", "reset": "처음 상태로 초기화",
+}
+
+
 def _sb():
     """Secrets 에 [supabase] 설정이 없으면 None → 백업 없이 로컬 파일만 사용"""
     try:
         s = st.secrets["supabase"]
-        url = f"{s['url'].rstrip('/')}/storage/v1/object/{s['bucket']}/{os.path.basename(WORK_DB)}"
-        return url, {"apikey": s["key"], "Authorization": f"Bearer {s['key']}"}
+        return {"root": f"{s['url'].rstrip('/')}/storage/v1", "bucket": s["bucket"],
+                "headers": {"apikey": s["key"], "Authorization": f"Bearer {s['key']}"}}
     except Exception:
         return None
+
+
+def _obj(cfg, key):
+    return f"{cfg['root']}/object/{cfg['bucket']}/{key}"
+
+
+def _snap_name(tag, who):
+    now = datetime.now(KST)
+    return f"{now:%Y%m%d_%H%M%S}{now.microsecond // 1000:03d}__m{int(who)}__{tag}.db"
+
+
+def _copy(cfg, src, dst):
+    """Supabase 서버 안에서 파일 복사 (내려받았다 다시 올리지 않음)"""
+    r = requests.post(f"{cfg['root']}/object/copy", headers={**cfg["headers"], "x-upsert": "true"}, timeout=60,
+                      json={"bucketId": cfg["bucket"], "sourceKey": src, "destinationKey": dst})
+    return r.ok
+
+
+def list_snapshots(cfg=None):
+    """시점 기록 파일 이름 목록 (최신순). Supabase 를 못 쓰거나 조회에 실패하면 None"""
+    cfg = cfg or _sb()
+    if cfg is None:
+        return None
+    try:
+        r = requests.post(f"{cfg['root']}/object/list/{cfg['bucket']}", headers=cfg["headers"], timeout=30,
+                          json={"prefix": SNAP_DIR + "/", "limit": 200, "offset": 0,
+                                "sortBy": {"column": "name", "order": "desc"}})
+        if not r.ok:
+            print(f"[backup] 시점 목록 조회 실패: {r.status_code} {r.text[:200]}")
+            return None
+        return sorted((o.get("name", "") for o in r.json() if _SNAP_RE.match(o.get("name", ""))), reverse=True)
+    except (requests.RequestException, ValueError) as e:
+        print(f"[backup] 시점 목록 조회 실패: {e}")
+        return None
+
+
+def _prune(cfg, newest_first):
+    old = newest_first[SNAP_KEEP:]
+    if old:
+        requests.delete(f"{cfg['root']}/object/{cfg['bucket']}", headers=cfg["headers"], timeout=60,
+                        json={"prefixes": [f"{SNAP_DIR}/{n}" for n in old]})
 
 
 def pull_db():
@@ -209,7 +266,7 @@ def pull_db():
     if cfg is None:
         return False
     try:
-        r = requests.get(cfg[0], headers=cfg[1], timeout=60)
+        r = requests.get(_obj(cfg, MAIN_KEY), headers=cfg["headers"], timeout=60)
         if r.status_code == 200 and r.content.startswith(b"SQLite format 3"):
             with open(WORK_DB, "wb") as f:
                 f.write(r.content)
@@ -220,20 +277,83 @@ def pull_db():
     return False
 
 
-def push_db():
-    """쓰기가 성공한 뒤: 작업 DB 를 통째로 올린다 (같은 경로면 덮어쓰기). 실패해도 앱은 계속 동작"""
+def push_db(tag="save", who=0):
+    """쓰기가 성공한 뒤: 작업 DB 를 통째로 올리고(최신 백업), 그 상태를 '시점 기록'으로도 남긴다.
+    실패해도 앱은 계속 동작"""
     cfg = _sb()
     if cfg is None:
         return
     try:
+        snaps = list_snapshots(cfg)
+        if snaps == []:          # 첫 기록이면, 덮어쓰기 전 백업(= 이 작업 직전 상태)을 기준점으로 남긴다 (백업이 없으면 무시)
+            _copy(cfg, MAIN_KEY, f"{SNAP_DIR}/{_snap_name('baseline', 0)}")
         with open(WORK_DB, "rb") as f:
-            r = requests.post(cfg[0], data=f, timeout=120,
-                              headers={**cfg[1], "x-upsert": "true",
+            r = requests.post(_obj(cfg, MAIN_KEY), data=f, timeout=120,
+                              headers={**cfg["headers"], "x-upsert": "true",
                                        "Content-Type": "application/octet-stream"})
         if not r.ok:
             print(f"[backup] push 실패: {r.status_code} {r.text[:200]}")
+            return
+        if snaps is not None:
+            name = _snap_name(tag, who)
+            if _copy(cfg, MAIN_KEY, f"{SNAP_DIR}/{name}"):
+                _prune(cfg, [name] + snaps)
+            else:
+                print("[backup] 시점 기록 복사 실패")
     except requests.RequestException as e:
         print(f"[backup] push 실패: {e}")
+
+
+def _install_db(data):
+    """내려받은 DB 를 검사한 뒤 WORK_DB 로 교체 (임시 파일에 쓰고 한 번에 바꿈)"""
+    tmp = WORK_DB + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    con = None
+    try:
+        con = sqlite3.connect(tmp)
+        con.execute("SELECT 1 FROM team_member LIMIT 1")
+    except sqlite3.DatabaseError as e:
+        os.remove(tmp)
+        raise RuleError(f"내려받은 파일이 이 앱의 DB가 아닙니다: {e}")
+    finally:
+        if con is not None:
+            con.close()
+    os.replace(tmp, WORK_DB)
+
+
+def restore_snapshot(name, who=0):
+    """시점 기록 하나를 작업 DB 로 되돌리고, 최신 백업도 그 상태로 맞춘다 (되돌리기 자체도 새 시점으로 남는다)"""
+    cfg = _sb()
+    if cfg is None:
+        raise RuleError("Supabase 백업이 설정되어 있지 않습니다")
+    if not _SNAP_RE.match(name):
+        raise RuleError("올바르지 않은 시점 이름입니다")
+    try:
+        r = requests.get(_obj(cfg, f"{SNAP_DIR}/{name}"), headers=cfg["headers"], timeout=60)
+    except requests.RequestException as e:
+        raise RuleError(f"시점 기록을 내려받지 못했습니다: {e}")
+    if r.status_code != 200 or not r.content.startswith(b"SQLite format 3"):
+        raise RuleError(f"시점 기록을 내려받지 못했습니다 (응답 {r.status_code})")
+    _install_db(r.content)
+    push_db("restore", who)
+
+
+def reset_to_original(who=0):
+    """원본 DB(SRC_DB)로 완전히 초기화하고 백업도 맞춘다 (직전 상태는 시점 기록에 남아 있다)"""
+    if not os.path.exists(SRC_DB):
+        raise RuleError(f"{os.path.basename(SRC_DB)} 파일이 없어 초기화할 수 없습니다")
+    reset_db()
+    push_db("reset", who)
+
+
+def snapshot_label(name, names):
+    """snapshots/ 파일 이름 → 화면에 보여줄 설명 (시각 · 누가 · 무슨 작업)"""
+    ts, who, tag = name[:-3].split("__", 2)
+    t = f"{datetime.strptime(ts[:15], '%Y%m%d_%H%M%S'):%m/%d %H:%M:%S}"
+    if tag == "baseline":
+        return f"{t} · 기준점 (첫 기록 직전의 상태)"
+    return f"{t} · {names.get(int(who[1:]), '알 수 없음')} · {ACTION_LABELS.get(tag, tag)}"
 
 
 # ───────────────────── 2) 업무 규칙 함수 ─────────────────────
@@ -476,6 +596,12 @@ def sql_box(sql):
         st.code(sql.strip(), language="sql")
 
 
+def _tag(fn, kw):
+    """시점 기록 파일 이름에 넣을 작업 이름 (영문·숫자·_·- 만)"""
+    t = re.sub(r"[^A-Za-z0-9_-]", "", fn.__name__.lstrip("_"))
+    return t + "-submit" if kw.get("submit") else t
+
+
 def act(fn, *args, ok="완료", **kw):
     """규칙 위반·DB 거부를 화면에 그대로 보여준다.  성공하면 메시지를 남기고 새로고침."""
     con = connect()
@@ -487,7 +613,7 @@ def act(fn, *args, ok="완료", **kw):
         st.error(f"DB가 거부함: {e}")
     else:
         con.close()
-        push_db()                                # 쓰기 성공 → 외부에 백업
+        push_db(_tag(fn, kw), st.session_state.get("_me", 0))     # 쓰기 성공 → 외부에 백업 + 시점 기록
         st.session_state["flash"] = ok
         st.rerun()
     finally:
@@ -943,6 +1069,56 @@ def page_manage(me, names, projects, project_id):
         st.info("확정된 프로젝트입니다.")
 
 
+def _forget_widget_state():
+    """DB 가 통째로 바뀐 뒤에는 이전 프로젝트·후보 선택이 없는 값일 수 있으므로 선택 상태를 지운다"""
+    for k in list(st.session_state.keys()):
+        if str(k).startswith(("proj_", "dec_c")):
+            del st.session_state[k]
+
+
+def act_file(fn, *args, ok):
+    """DB 파일 전체를 바꾸는 작업 (되돌리기·초기화) — 실패하면 메시지, 성공하면 새로고침"""
+    try:
+        fn(*args)
+    except RuleError as e:
+        st.error(str(e))
+    else:
+        _forget_widget_state()
+        st.session_state["flash"] = ok
+        st.rerun()
+
+
+def page_undo(me, names):
+    st.caption("저장할 때마다 그 시점의 DB가 기록됩니다 (최근 30개). 시점을 고르면 그 작업 직후의 상태로 DB 전체가 돌아가고, "
+               "그 이후에 한 모든 팀원의 작업은 사라집니다.")
+    st.subheader("시점으로 되돌리기")
+    snaps = list_snapshots()
+    if snaps is None:
+        st.info("Supabase 백업이 설정되어 있지 않거나 연결에 실패해 시점 기록을 쓸 수 없습니다. "
+                "(Streamlit Secrets 의 [supabase] 설정과 Manage app → Logs 의 [backup] 줄을 확인하세요)")
+    elif not snaps:
+        st.info("아직 기록된 시점이 없습니다. 무언가를 저장하면 여기에 쌓입니다.")
+    else:
+        labels = [snapshot_label(n, names) for n in snaps]
+        i = st.selectbox("되돌릴 시점 (그 작업 직후의 상태로 돌아갑니다)", range(len(snaps)),
+                         format_func=lambda k: ("(현재) " if k == 0 else "") + labels[k])
+        if i == 0:
+            st.info("가장 최근 상태입니다. 방금 한 작업을 취소하려면 한 칸 아래 시점을 고르세요.")
+        else:
+            st.warning(f"되돌리면 아래 {i}건의 작업이 사라집니다 (다른 팀원의 작업 포함).")
+            st.markdown("\n".join(f"- {l}" for l in labels[:i]))
+            sure = st.checkbox("위 작업이 모두 사라지는 것을 확인했습니다", key=f"undo_ok_{snaps[i]}")
+            if st.button("이 시점으로 되돌리기", type="primary", disabled=not sure):
+                act_file(restore_snapshot, snaps[i], me, ok="선택한 시점으로 되돌렸습니다.")
+
+    with st.expander("처음 상태(원본 DB)로 초기화"):
+        st.warning("모든 프로젝트·후보·검토가 사라지고 원본 DB 상태가 됩니다. "
+                   "초기화 직전 상태는 시점 기록에 남아 있어 위에서 다시 되돌릴 수 있습니다.")
+        sure2 = st.checkbox("모든 데이터를 지우고 처음 상태로 돌리는 것을 확인했습니다", key="reset_ok")
+        if st.button("처음 상태로 초기화", disabled=not sure2):
+            act_file(reset_to_original, me, ok="처음 상태로 초기화했습니다.")
+
+
 def main():
     st.set_page_config(page_title="선행기술 조사·검토", layout="wide")
     if not os.path.exists(WORK_DB):
@@ -966,6 +1142,7 @@ def main():
         if "mock" in os.path.basename(SRC_DB).lower():
             st.caption("※ mock 데이터 — 프로젝트 주제·검토 숫자는 가짜입니다.")
         me = st.selectbox("현재 사용자", list(names), format_func=names.get)
+        st.session_state["_me"] = int(me)                          # 시점 기록에 '누가' 했는지 남기려고
         own = projects[projects.owner_id == me].project_id.astype(int).tolist()
         ids = list(ptitle)
         if st.session_state.pop("_reset_project", False):         # 선택한 프로젝트를 삭제한 직후
@@ -977,11 +1154,13 @@ def main():
             format_func=lambda i: ptitle[i] + (" ← 내 프로젝트" if i in own else "")) if ids else None
         if "page" not in st.session_state:
             st.session_state["page"] = "대시보드" if ids else "프로젝트 관리"
-        page = st.radio("화면", ["대시보드", "특허 탐색", "검토", "프로젝트 관리"], key="page")
+        page = st.radio("화면", ["대시보드", "특허 탐색", "검토", "프로젝트 관리", "되돌리기"], key="page")
 
     if "flash" in st.session_state:
         st.toast(st.session_state.pop("flash"))
-    if page == "프로젝트 관리":
+    if page == "되돌리기":
+        page_undo(me, names)
+    elif page == "프로젝트 관리":
         page_manage(me, names, projects, project_id)
     elif project_id is None:
         st.info("아직 프로젝트가 없습니다. '프로젝트 관리'에서 먼저 만드세요.")
